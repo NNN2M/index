@@ -1,20 +1,20 @@
 """
 Telegram Bot with Gemini 2.5 Flash Integration
-Professional bot built with aiogram 3.x
+Professional bot built with aiogram 3.x and official google-genai SDK
 """
 
 import asyncio
 import logging
 import os
-from typing import Optional
+from typing import Dict, List
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import CommandStart, Command
 from aiogram.types import Message
 from aiogram.enums import ParseMode
 from aiogram.client.default import DefaultBotProperties
-import google.generativeai as genai
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+from google import genai
+from google.genai import types
 
 # Configure logging
 logging.basicConfig(
@@ -33,32 +33,12 @@ if not TELEGRAM_TOKEN:
 if not GEMINI_API_KEY:
     raise ValueError("GEMINI_API_KEY environment variable is required")
 
-# Configure Gemini API
-genai.configure(api_key=GEMINI_API_KEY)
+# Initialize Gemini Client
+client = genai.Client(api_key=GEMINI_API_KEY)
+MODEL_NAME = "gemini-2.5-flash"
 
-# Create Gemini model instance
-generation_config = {
-    "temperature": 1,
-    "top_p": 0.95,
-    "top_k": 40,
-    "max_output_tokens": 8192,
-}
-
-safety_settings = {
-    HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_SEXUALLY_EXPLICIT: HarmBlockThreshold.BLOCK_NONE,
-    HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
-}
-
-model = genai.GenerativeModel(
-    model_name="gemini-2.0-flash-exp",
-    generation_config=generation_config,
-    safety_settings=safety_settings
-)
-
-# Store chat sessions per user
-chat_sessions = {}
+# Store chat history per user
+chat_histories: Dict[int, List[types.Content]] = {}
 
 # Initialize bot and dispatcher
 bot = Bot(
@@ -68,11 +48,56 @@ bot = Bot(
 dp = Dispatcher()
 
 
-def get_chat_session(user_id: int):
-    """Get or create a chat session for a user"""
-    if user_id not in chat_sessions:
-        chat_sessions[user_id] = model.start_chat(history=[])
-    return chat_sessions[user_id]
+def get_chat_history(user_id: int) -> List[types.Content]:
+    """Get or create chat history for a user"""
+    if user_id not in chat_histories:
+        chat_histories[user_id] = []
+    return chat_histories[user_id]
+
+
+async def generate_gemini_response(user_id: int, user_message: str) -> str:
+    """Generate response from Gemini API with conversation history"""
+    history = get_chat_history(user_id)
+
+    # Add user message to history
+    history.append(
+        types.Content(
+            role="user",
+            parts=[types.Part.from_text(text=user_message)]
+        )
+    )
+
+    # Generate response
+    response_text = ""
+    try:
+        generate_config = types.GenerateContentConfig(
+            temperature=1.0,
+            top_p=0.95,
+            top_k=40,
+            max_output_tokens=8192,
+        )
+
+        response = client.models.generate_content(
+            model=MODEL_NAME,
+            contents=history,
+            config=generate_config,
+        )
+
+        response_text = response.text
+
+        # Add assistant response to history
+        history.append(
+            types.Content(
+                role="model",
+                parts=[types.Part.from_text(text=response_text)]
+            )
+        )
+
+    except Exception as e:
+        logger.error(f"Gemini API error: {e}")
+        raise
+
+    return response_text
 
 
 @dp.message(CommandStart())
@@ -104,8 +129,8 @@ async def command_start_handler(message: Message):
 async def command_new_handler(message: Message):
     """Handle /new command - start a new conversation"""
     user_id = message.from_user.id
-    if user_id in chat_sessions:
-        del chat_sessions[user_id]
+    if user_id in chat_histories:
+        chat_histories[user_id] = []
 
     await message.answer(
         "✅ تم بدء محادثة جديدة!\n"
@@ -149,14 +174,8 @@ async def handle_message(message: Message):
     await bot.send_chat_action(message.chat.id, "typing")
 
     try:
-        # Get user's chat session
-        chat = get_chat_session(user_id)
-
-        # Send message to Gemini
-        response = chat.send_message(user_text)
-
-        # Get response text
-        response_text = response.text
+        # Generate response from Gemini
+        response_text = await generate_gemini_response(user_id, user_text)
 
         # Split long messages (Telegram has 4096 char limit)
         if len(response_text) > 4000:
